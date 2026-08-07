@@ -1,0 +1,7 @@
+streamlit>=1.36
+requests>=2.31
+beautifulsoup4>=4.12
+pandas>=2.0
+groq>=0.11
+google-api-python-client>=2.100
+google-auth>=2.30

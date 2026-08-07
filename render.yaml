@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: canipro
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app/dashboard.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      # Set your Groq key in the Render dashboard (Environment tab). Optional —
+      # the app falls back to a heuristic clusterer when it is not set.
+      - key: GROQ_API_KEY
+        sync: false
