@@ -1005,10 +1005,7 @@ def _gsc_plan_context(keyword: str, sub: pd.DataFrame, pos_spread: float, impres
 
 def render_fix_plan(plan: dict, anchor_key: str):
     """Render a data-specific plan: a multi-point 'problem' diagnosis + a priority-grouped checklist."""
-    diag = [d for d in plan.get("diagnosis", []) if d]
-    if diag:
-        st.markdown("#### 🔴 Why this is holding the page back")
-        st.markdown("\n".join(f"{i}. {d}" for i, d in enumerate(diag, 1)))
+    render_diagnosis(plan)
 
     st.markdown("#### ✅ Actionable checklist")
     checklist = plan.get("checklist", {})
@@ -1022,6 +1019,163 @@ def render_fix_plan(plan: dict, anchor_key: str):
         st.markdown("\n".join(f"- [ ] {it}" for it in items))
     if not rendered:  # ultimate fallback
         st.markdown("\n".join(f"- [ ] {s}" for s in FIX_CHECKLIST))
+
+
+def render_diagnosis(plan: dict):
+    """Render just the multi-point 'why this is holding the page back' diagnosis."""
+    diag = [d for d in plan.get("diagnosis", []) if d]
+    if diag:
+        st.markdown("#### 🔴 Why this is holding the page back")
+        st.markdown("\n".join(f"{i}. {d}" for i, d in enumerate(diag, 1)))
+
+
+# --------------------------------------------------------------------------- #
+# Per-link (per-URL) checklists — what to do for THIS specific page
+# --------------------------------------------------------------------------- #
+# Instead of one checklist for the whole cluster, each competing URL gets its
+# own to-do list, keyed to its role (the pillar/winner you keep vs. a secondary
+# you consolidate) and its actual signals/metrics.
+def _crawl_primary(keyword: str, pages: list[dict]) -> dict:
+    """Pick the pillar page for a crawled cluster: most on-topic for the keyword,
+    tie-broken by content depth (same logic as build_crawl_fix_plan)."""
+    kw_tokens = keyword_signature({"title": keyword})
+
+    def _relevance(p: dict) -> int:
+        slug = urlparse(p["url"]).path.replace("-", " ").replace("/", " ")
+        sig = keyword_signature({"title": f"{p.get('title','')} {p.get('h1','')} {slug}"})
+        return len(kw_tokens & sig)
+
+    return max(pages, key=lambda p: (_relevance(p), p.get("word_count", 0)))
+
+
+def build_crawl_link_checklist(keyword: str, page: dict, primary: dict) -> tuple[str, list[str]]:
+    """What to do for ONE crawled URL, given its role in the cluster.
+
+    Returns (role_label, [checklist items]) using the page's real signals
+    (title / og:title / twitter:title / H1 / word count / alt coverage / schema).
+    """
+    is_primary = page["url"] == primary["url"]
+    pth = _path(page["url"])
+    actions: list[str] = []
+
+    if is_primary:
+        role = "🏆 Primary / pillar — keep this and consolidate the others into it"
+        tags = {
+            "<title>": page.get("title", ""),
+            "og:title": page.get("og_title", ""),
+            "twitter:title": page.get("tw_title", ""),
+            "H1": page.get("h1", ""),
+        }
+        present = {k: v for k, v in tags.items() if v}
+        distinct = {v.strip().lower() for v in present.values()}
+        if len(present) >= 2 and len(distinct) >= 2:
+            listed = "; ".join(f"{k} = {_q(v)}" for k, v in present.items())
+            actions.append(
+                f"Align every targeting tag to **{keyword}** — <title>, og:title, twitter:title and H1 "
+                f"currently disagree ({listed})."
+            )
+        else:
+            actions.append(f"Confirm <title>, og:title, twitter:title and H1 all target **{keyword}**.")
+        wc = page.get("word_count", 0)
+        if wc < 500:
+            actions.append(
+                f"Expand from ~{wc:,} to 500–800+ words — real pricing/ranges, process specifics and "
+                f"comparisons so it out-depths the pages consolidating into it."
+            )
+        actions.append("Add an FAQ section (captures long-tail queries + enables FAQ schema).")
+        if page.get("n_imgs", 0) and page.get("n_missing_alt", 0):
+            actions.append(
+                f"Add descriptive, keyword-relevant alt text — "
+                f"{page['n_missing_alt']}/{page['n_imgs']} images are missing alt attributes."
+            )
+        stypes = page.get("schema_types", [])
+        if not any(t in {"Service", "LocalBusiness", "Product"} for t in stypes):
+            found = ", ".join(stypes) if stypes else "none detected"
+            actions.append(f"Add Service / LocalBusiness schema (schema currently: {found}).")
+        can = page.get("canonical", "")
+        if can and _path(can) != pth:
+            actions.append(f"Fix the canonical — it points to `{_path(can)}`, not itself.")
+        else:
+            actions.append("Confirm the canonical points to itself.")
+        actions.append(
+            f"Re-check rankings for {_q(keyword, 40)} 3–4 weeks after the other pages are consolidated in."
+        )
+    else:
+        pp = _path(primary["url"])
+        role = "↪️ Secondary — consolidate into the pillar"
+        actions.append(
+            f"Trim the **{keyword}** section here (~{page.get('word_count', 0):,} words, near-duplicate) "
+            f"to 1–2 sentences + a link to the pillar."
+        )
+        actions.append(
+            f"Add an internal link to the pillar `{pp}` using anchor text like {_q(keyword, 40)}."
+        )
+        actions.append(
+            f"301-redirect to `{pp}`, or add rel=\"canonical\" → `{pp}` if it must stay live."
+        )
+        for tag, val in (("og:title", page.get("og_title", "")), ("twitter:title", page.get("tw_title", ""))):
+            own = keyword_signature({"title": f"{page.get('title','')} {page.get('h1','')}"})
+            valsig = keyword_signature({"title": val})
+            if val and own and valsig and not (own & valsig):
+                actions.append(
+                    f"Fix the {tag} — it reads {_q(val)}, unrelated to this page (leftover template tag)."
+                )
+        actions.append(
+            "If it must stay live, differentiate it: rewrite title, H1 and intro to target a distinct query."
+        )
+    return role, actions
+
+
+def build_gsc_link_checklist(keyword: str, row: dict, winner: dict, is_winner: bool) -> tuple[str, list[str]]:
+    """What to do for ONE GSC URL, given its role (winner vs consolidate) and its
+    real clicks / impressions / position numbers."""
+    pth = _path(str(row["page"]))
+    wu = _path(str(winner["page"]))
+    actions: list[str] = []
+
+    if is_winner:
+        role = "🏆 Winner — keep this and consolidate the others into it"
+        actions.append(
+            f"Keep as the single winner (best position {float(row['position']):.1f}, "
+            f"{int(row['clicks']):,} clicks)."
+        )
+        actions.append("Merge any unique sections from the other URLs in here before redirecting them.")
+        actions.append("Update the sitemap and request re-indexing for this URL in Search Console.")
+        actions.append(
+            f"Re-check {_q(keyword, 40)} in 2–4 weeks — clicks and position should consolidate here."
+        )
+    else:
+        role = "↪️ Consolidate into the winner"
+        actions.append(
+            f"Confirm it targets the same intent as {_q(keyword, 40)}; if it differs, re-target it "
+            f"instead of merging."
+        )
+        actions.append(f"301-redirect to `{wu}`, or add rel=\"canonical\" → `{wu}`.")
+        actions.append(f"Re-anchor internal links for {_q(keyword, 40)} to point at `{wu}` only.")
+        actions.append(
+            f"This page holds pos {float(row['position']):.1f}, {int(row['clicks']):,} clicks, "
+            f"{int(row['impressions']):,} impr — merge that value into the winner so nothing is lost."
+        )
+    return role, actions
+
+
+def render_link_checklist(url: str, role: str, actions: list[str], meta_md: str | None = None):
+    """Render one competing URL as a click-to-open panel holding ITS OWN checklist.
+
+    The expander label is the URL, so clicking a link reveals what to do for that
+    specific page. (Expanders can't be nested, so the caller must place this inside
+    a plain container, not another expander.)"""
+    with st.expander(f"🔗 {url}"):
+        st.caption(role)
+        if meta_md:
+            st.markdown(meta_md)
+        st.markdown("**✅ Checklist for this URL:**")
+        st.markdown("\n".join(f"- [ ] {a}" for a in actions))
+        safe_url = html.escape(url, quote=True)
+        st.markdown(
+            f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">Open page ↗</a>',
+            unsafe_allow_html=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1112,14 +1266,30 @@ with tab_crawl:
                             plan = build_crawl_fix_plan(g["keyword"], cps)
                         plans.append(plan)
 
+                st.markdown("### Affected keywords")
+                st.caption("Each cluster lists its competing pages — **click a URL to see the checklist for that page.**")
                 for i, (g, plan) in enumerate(zip(groups, plans)):
-                    with st.expander(f"[{g['severity']}] {g['keyword']} — {len(g['urls'])} URLs"):
-                        titles = g.get("titles", [""] * len(g["urls"]))
-                        st.markdown("**🔗 Competing pages:**")
-                        render_cluster_links(g["urls"], titles)
+                    cps = [sig_by_url[u] for u in g["urls"] if u in sig_by_url]
+                    primary = _crawl_primary(g["keyword"], cps) if cps else None
+                    titles = g.get("titles", [""] * len(g["urls"]))
+                    title_by_url = {u: t for u, t in zip(g["urls"], titles)}
+                    with st.container(border=True):
+                        st.markdown(f"#### [{g['severity']}] {g['keyword']} — {len(g['urls'])} URLs")
+                        # Why the cluster competes (shared across its pages).
+                        render_diagnosis(plan)
                         if g.get("recommendation"):
                             st.info("💡 " + g["recommendation"])
-                        render_fix_plan(plan, f"crawl::{i}")
+                        # Per-link checklists: click a URL to open its own to-do list.
+                        st.markdown("**🔗 Competing pages — click one for its checklist:**")
+                        for u in g["urls"]:
+                            page = sig_by_url.get(u)
+                            if page and primary:
+                                role, actions = build_crawl_link_checklist(g["keyword"], page, primary)
+                            else:  # no crawled signals for this URL — generic guidance
+                                role, actions = "Competing page", list(FIX_CHECKLIST)
+                            t = title_by_url.get(u, "")
+                            meta = f"*{html.escape(t)}*" if t else None
+                            render_link_checklist(u, role, actions, meta_md=meta)
                 df_download_buttons(rep, "cannibalization_crawl_report")
 
 # ---- Tab 2: GSC ---------------------------------------------------------- #
@@ -1202,29 +1372,27 @@ with tab_gsc:
                         plans[kw] = (sub, plan)
 
                 st.markdown("### Affected keywords")
+                st.caption("Each keyword lists the URLs competing for it — **click a URL to see the checklist for that page.**")
                 for i, (_, r) in enumerate(report.iterrows()):
-                    label = (f"[{r['severity']}] {r['keyword']} — {r['competing_urls']} URLs · "
-                             f"{r['impressions']:,} impr · pos {r['avg_position']}")
                     sub, plan = plans[r["keyword"]]
-                    with st.expander(label):
-                        # 1) Clickable competing URLs with their metrics.
-                        st.markdown("**🔗 Competing pages ranking for this keyword:**")
-                        cols = st.columns([3, 1, 1, 1])
-                        cols[0].markdown("**URL**"); cols[1].markdown("**Clicks**")
-                        cols[2].markdown("**Impr**"); cols[3].markdown("**Pos**")
-                        for _, s in sub.sort_values("position").iterrows():
-                            cc = st.columns([3, 1, 1, 1])
-                            safe_url = html.escape(str(s["page"]), quote=True)
-                            cc[0].markdown(
-                                f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">'
-                                f'{html.escape(str(s["page"]))}</a>',
-                                unsafe_allow_html=True,
-                            )
-                            cc[1].write(int(s["clicks"]))
-                            cc[2].write(int(s["impressions"]))
-                            cc[3].write(round(s["position"], 1))
-                        # 2) The problem + 3) the data-specific checklist.
-                        render_fix_plan(plan, f"gsc::{i}")
+                    ranked = sub.sort_values("position").reset_index(drop=True)
+                    winner = ranked.iloc[0].to_dict() if not ranked.empty else None
+                    with st.container(border=True):
+                        st.markdown(
+                            f"#### [{r['severity']}] {r['keyword']} — {r['competing_urls']} URLs · "
+                            f"{r['impressions']:,} impr · pos {r['avg_position']}"
+                        )
+                        # Why the keyword is cannibalized (shared across its URLs).
+                        render_diagnosis(plan)
+                        # Per-link checklists: click a URL to open its own to-do list.
+                        st.markdown("**🔗 Competing pages — click one for its checklist:**")
+                        for _, s in ranked.iterrows():
+                            row = s.to_dict()
+                            is_winner = winner is not None and str(row["page"]) == str(winner["page"])
+                            role, actions = build_gsc_link_checklist(r["keyword"], row, winner, is_winner)
+                            meta = (f"**{int(row['clicks']):,}** clicks · **{int(row['impressions']):,}** impr · "
+                                    f"pos **{float(row['position']):.1f}**")
+                            render_link_checklist(str(row["page"]), role, actions, meta_md=meta)
 
                 df_download_buttons(report, "cannibalization_gsc_report")
 
