@@ -529,16 +529,133 @@ def analyze_gsc(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Export helpers
 # --------------------------------------------------------------------------- #
-def df_download_buttons(df: pd.DataFrame, basename: str):
+def df_download_buttons(df: pd.DataFrame, basename: str,
+                        pdf_sections: list[dict] | None = None,
+                        pdf_title: str | None = None,
+                        pdf_summary: list[str] | None = None):
     exp = df.copy()
     for c in exp.columns:
         if exp[c].apply(lambda x: isinstance(x, list)).any():
             exp[c] = exp[c].apply(lambda x: " ; ".join(x) if isinstance(x, list) else x)
-    c1, c2 = st.columns(2)
-    c1.download_button("⬇️ Download CSV", exp.to_csv(index=False).encode("utf-8"),
-                       f"{basename}.csv", "text/csv", use_container_width=True)
-    c2.download_button("⬇️ Download JSON", df.to_json(orient="records", indent=2).encode("utf-8"),
-                       f"{basename}.json", "application/json", use_container_width=True)
+    cols = st.columns(3 if pdf_sections is not None else 2)
+    cols[0].download_button("⬇️ Download CSV", exp.to_csv(index=False).encode("utf-8"),
+                            f"{basename}.csv", "text/csv", use_container_width=True)
+    cols[1].download_button("⬇️ Download JSON", df.to_json(orient="records", indent=2).encode("utf-8"),
+                            f"{basename}.json", "application/json", use_container_width=True)
+    if pdf_sections is not None:
+        try:
+            pdf_bytes = build_pdf_report(pdf_title or "Cannibalization report",
+                                         pdf_summary or [], pdf_sections)
+            cols[2].download_button("⬇️ Download PDF report", pdf_bytes,
+                                    f"{basename}.pdf", "application/pdf",
+                                    use_container_width=True)
+        except Exception as e:  # fpdf2 missing or render failure — never crash the page
+            cols[2].caption(f"PDF export needs `fpdf2` — pip install fpdf2 ({type(e).__name__})")
+
+
+# --------------------------------------------------------------------------- #
+# PDF report
+# --------------------------------------------------------------------------- #
+def _pdf_text(s: str) -> str:
+    """Make text safe for FPDF's Latin-1 core fonts (map smart punctuation, drop emoji)."""
+    if not s:
+        return ""
+    repl = {
+        "’": "'", "‘": "'", "“": '"', "”": '"',
+        "–": "-", "—": "-", "…": "...", "→": "->",
+        "↪": "->", "↗": "^", "↑": "", "↓": "",
+        "≥": ">=", "≤": "<=", "×": "x", "·": "-",
+        "✓": "-", "•": "-", " ": " ",
+    }
+    for k, v in repl.items():
+        s = s.replace(k, v)
+    return s.encode("latin-1", "ignore").decode("latin-1")
+
+
+def _pdf_plain(s: str) -> str:
+    """Strip light markdown (**bold**, `code`) then make the text PDF-safe."""
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s or "")
+    s = s.replace("`", "")
+    return _pdf_text(s)
+
+
+def build_pdf_report(title: str, summary: list[str], sections: list[dict]) -> bytes:
+    """Render a cannibalization report to PDF bytes. Raises if fpdf2 isn't installed."""
+    from fpdf import FPDF
+
+    sev_rgb = {"Critical": (185, 28, 28), "High": (154, 52, 18),
+               "Medium": (133, 77, 14), "Low": (55, 65, 81)}
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    def cell(h: float, txt: str, wrap: str = "WORD"):
+        # multi_cell in fpdf2 defaults to leaving the cursor at the right edge, so
+        # the next call gets zero width — reset to the left margin every time.
+        # wrap="CHAR" lets long unbroken strings (URLs) break mid-word without raising.
+        pdf.multi_cell(0, h, txt, new_x="LMARGIN", new_y="NEXT", wrapmode=wrap)
+
+    pdf.set_font("Helvetica", "B", 18)
+    cell(9, _pdf_plain(title))
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(110, 110, 110)
+    cell(6, _pdf_text(f"Generated {date.today().isoformat()}  -  "
+                      "Keyword Cannibalization Detector"))
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
+
+    if summary:
+        pdf.set_font("Helvetica", "B", 12)
+        cell(7, "Summary")
+        pdf.set_font("Helvetica", "", 10)
+        for line in summary:
+            cell(6, _pdf_plain(f"- {line}"))
+        pdf.ln(3)
+
+    for sec in sections:
+        pdf.set_font("Helvetica", "B", 13)
+        r, g, b = sev_rgb.get(sec.get("severity", ""), (17, 24, 39))
+        pdf.set_text_color(r, g, b)
+        cell(7, _pdf_plain(sec.get("heading", "")))
+        pdf.set_text_color(0, 0, 0)
+
+        for u in sec.get("urls", []):
+            pdf.set_font("Helvetica", "I", 9)
+            pdf.set_text_color(80, 80, 80)
+            cell(5, _pdf_text(f"   - {u}"), wrap="CHAR")
+            pdf.set_text_color(0, 0, 0)
+
+        if sec.get("recommendation"):
+            pdf.set_font("Helvetica", "", 10)
+            cell(6, _pdf_plain(f"Recommendation: {sec['recommendation']}"))
+
+        diag = [d for d in sec.get("diagnosis", []) if d]
+        if diag:
+            pdf.ln(1)
+            pdf.set_font("Helvetica", "B", 10)
+            cell(6, "Why this is holding the page back")
+            pdf.set_font("Helvetica", "", 10)
+            for i, d in enumerate(diag, 1):
+                cell(6, _pdf_plain(f"{i}. {d}"), wrap="CHAR")
+
+        checklist = sec.get("checklist", {})
+        if any(checklist.get(k) for k, _ in PLAN_BUCKETS):
+            pdf.ln(1)
+            pdf.set_font("Helvetica", "B", 10)
+            cell(6, "Actionable checklist")
+            for slug, heading in PLAN_BUCKETS:
+                items = [it for it in checklist.get(slug, []) if it]
+                if not items:
+                    continue
+                pdf.set_font("Helvetica", "B", 9)
+                cell(6, _pdf_plain(heading))
+                pdf.set_font("Helvetica", "", 10)
+                for it in items:
+                    cell(6, _pdf_plain(f"[ ] {it}"), wrap="CHAR")
+        pdf.ln(4)
+
+    return bytes(pdf.output())
 
 
 def severity_style(df: pd.DataFrame):
@@ -1197,6 +1314,83 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Deploy:** `streamlit run app/dashboard.py`")
 
+def render_crawl_results(crawl: dict):
+    """Render a stored crawl result. Reads everything from session_state so the
+    report survives Streamlit reruns (clicking an expander, switching tabs, etc.)
+    instead of vanishing the moment the Crawl button is no longer 'pressed'."""
+    pages = crawl.get("pages") or []
+    groups = crawl.get("groups") or []
+    rep = crawl.get("rep")
+    plans = crawl.get("plans") or []
+
+    if not pages:
+        st.error("No pages could be fetched. Check the URL, or the site may block crawlers.")
+        return
+    st.success(f"Fetched {len(pages)} pages.")
+    if not groups or rep is None:
+        st.success("✅ No keyword cannibalization detected across crawled pages.")
+        return
+
+    st.warning(f"Found {len(groups)} cannibalization cluster(s).")
+
+    # Graphical at-a-glance overview.
+    render_crawl_overview(rep)
+
+    # Full table (the raw url list isn't clickable here — the real
+    # clickable links live in each cluster's expander below).
+    with st.expander("📋 Full table", expanded=False):
+        st.dataframe(severity_style(rep.drop(columns=["urls"])), use_container_width=True)
+
+    sig_by_url = {p["url"]: p for p in pages}
+    st.markdown("### Affected keywords")
+    st.caption("Each cluster lists its competing pages — **click a URL to see the checklist for that page.**")
+    for g, plan in zip(groups, plans):
+        cps = [sig_by_url[u] for u in g["urls"] if u in sig_by_url]
+        primary = _crawl_primary(g["keyword"], cps) if cps else None
+        titles = g.get("titles", [""] * len(g["urls"]))
+        title_by_url = {u: t for u, t in zip(g["urls"], titles)}
+        with st.container(border=True):
+            st.markdown(f"#### [{g['severity']}] {g['keyword']} — {len(g['urls'])} URLs")
+            render_diagnosis(plan)
+            if g.get("recommendation"):
+                st.info("💡 " + g["recommendation"])
+            st.markdown("**🔗 Competing pages — click one for its checklist:**")
+            for u in g["urls"]:
+                page = sig_by_url.get(u)
+                if page and primary:
+                    role, actions = build_crawl_link_checklist(g["keyword"], page, primary)
+                else:  # no crawled signals for this URL — generic guidance
+                    role, actions = "Competing page", list(FIX_CHECKLIST)
+                t = title_by_url.get(u, "")
+                meta = f"*{html.escape(t)}*" if t else None
+                render_link_checklist(u, role, actions, meta_md=meta)
+
+    # Downloads — CSV / JSON / PDF.
+    counts = _sev_counts(rep)
+    summary = [
+        f"Pages crawled: {len(pages)}",
+        f"Cannibalization clusters: {len(rep)}",
+        f"Critical: {counts['Critical']}   High: {counts['High']}   "
+        f"Medium: {counts['Medium']}   Low: {counts['Low']}",
+        f"Total competing pages: {int(rep['competing_urls'].sum())}",
+    ]
+    sections = [
+        {
+            "heading": f"[{g['severity']}] {g['keyword']} — {len(g['urls'])} URLs",
+            "severity": g["severity"],
+            "urls": g["urls"],
+            "recommendation": g.get("recommendation", ""),
+            "diagnosis": plan.get("diagnosis", []),
+            "checklist": plan.get("checklist", {}),
+        }
+        for g, plan in zip(groups, plans)
+    ]
+    df_download_buttons(rep, "cannibalization_crawl_report",
+                        pdf_sections=sections,
+                        pdf_title="Keyword Cannibalization — Crawl Report",
+                        pdf_summary=summary)
+
+
 tab_crawl, tab_gsc = st.tabs(["🌐 Crawl a website", "📊 Search Console CSV"])
 
 
@@ -1205,12 +1399,17 @@ with tab_crawl:
     st.subheader("Scan a website for content cannibalization")
     url_in = st.text_input("Website URL", placeholder="https://example.com")
     c1, c2 = st.columns(2)
-    max_pages = c1.slider("Max pages to crawl", 5, 300, 60, step=5)
+    max_pages = c1.slider("Max pages to crawl", 5, 5000, 60, step=5)
     use_sitemap = c2.toggle("Use sitemap.xml if available", value=True)
 
-    if st.button("🚀 Crawl & analyze", type="primary", disabled=not url_in):
+    run = st.button("🚀 Crawl & analyze", type="primary", disabled=not url_in)
+    if st.session_state.get("crawl") is not None and not run:
+        if st.button("🗑️ Clear results"):
+            st.session_state.pop("crawl", None)
+            st.rerun()
+
+    if run:
         prog = st.progress(0.0, text="Starting…")
-        status = st.empty()
 
         def _p(done, total, cur):
             prog.progress(min(done / total, 1.0), text=f"Crawled {done}/{total} — {cur[:70]}")
@@ -1218,45 +1417,34 @@ with tab_crawl:
         with st.spinner("Crawling…"):
             pages = crawl_site(url_in, max_pages, use_sitemap, progress=_p)
         prog.empty()
-        status.success(f"Fetched {len(pages)} pages.")
 
-        if not pages:
-            st.error("No pages could be fetched. Check the URL, or the site may block crawlers.")
-        else:
+        groups: list[dict] = []
+        rep = None
+        plans: list[dict] = []
+        if pages:
             with st.spinner("Analyzing keyword overlap…"):
                 groups = analyze_crawl_with_groq(client, model, pages)
-            if not groups:
-                st.success("✅ No keyword cannibalization detected across crawled pages.")
-            else:
-                st.warning(f"Found {len(groups)} cannibalization cluster(s).")
-                rows = []
-                for g in groups:
-                    rows.append(
-                        {
-                            "keyword": g["keyword"],
-                            "severity": g["severity"],
-                            "competing_urls": len(g["urls"]),
-                            "urls": g["urls"],
-                            "recommendation": g.get("recommendation", ""),
-                        }
-                    )
+            if groups:
+                rows = [
+                    {
+                        "keyword": g["keyword"],
+                        "severity": g["severity"],
+                        "competing_urls": len(g["urls"]),
+                        "urls": g["urls"],
+                        "recommendation": g.get("recommendation", ""),
+                    }
+                    for g in groups
+                ]
                 rep = pd.DataFrame(rows).sort_values(
                     "severity", key=lambda s: s.map(SEVERITY_ORDER)
                 ).reset_index(drop=True)
-
-                # Graphical at-a-glance overview.
-                render_crawl_overview(rep)
-
-                # Full table (the raw url list isn't clickable here — the real
-                # clickable links live in each cluster's expander below).
-                with st.expander("📋 Full table", expanded=False):
-                    st.dataframe(severity_style(rep.drop(columns=["urls"])),
-                                 use_container_width=True)
+                # Keep the cluster/plan order aligned to the sorted report.
+                order = {kw: i for i, kw in enumerate(rep["keyword"])}
+                groups = sorted(groups, key=lambda g: order.get(g["keyword"], 0))
 
                 # Build a concrete, evidence-based fix plan per cluster from the
                 # real page signals (Groq-written when a key is set, else heuristic).
                 sig_by_url = {p["url"]: p for p in pages}
-                plans = []
                 with st.spinner("Building per-cluster fix plans…"):
                     for g in groups:
                         cps = [sig_by_url[u] for u in g["urls"] if u in sig_by_url]
@@ -1266,31 +1454,13 @@ with tab_crawl:
                             plan = build_crawl_fix_plan(g["keyword"], cps)
                         plans.append(plan)
 
-                st.markdown("### Affected keywords")
-                st.caption("Each cluster lists its competing pages — **click a URL to see the checklist for that page.**")
-                for i, (g, plan) in enumerate(zip(groups, plans)):
-                    cps = [sig_by_url[u] for u in g["urls"] if u in sig_by_url]
-                    primary = _crawl_primary(g["keyword"], cps) if cps else None
-                    titles = g.get("titles", [""] * len(g["urls"]))
-                    title_by_url = {u: t for u, t in zip(g["urls"], titles)}
-                    with st.container(border=True):
-                        st.markdown(f"#### [{g['severity']}] {g['keyword']} — {len(g['urls'])} URLs")
-                        # Why the cluster competes (shared across its pages).
-                        render_diagnosis(plan)
-                        if g.get("recommendation"):
-                            st.info("💡 " + g["recommendation"])
-                        # Per-link checklists: click a URL to open its own to-do list.
-                        st.markdown("**🔗 Competing pages — click one for its checklist:**")
-                        for u in g["urls"]:
-                            page = sig_by_url.get(u)
-                            if page and primary:
-                                role, actions = build_crawl_link_checklist(g["keyword"], page, primary)
-                            else:  # no crawled signals for this URL — generic guidance
-                                role, actions = "Competing page", list(FIX_CHECKLIST)
-                            t = title_by_url.get(u, "")
-                            meta = f"*{html.escape(t)}*" if t else None
-                            render_link_checklist(u, role, actions, meta_md=meta)
-                df_download_buttons(rep, "cannibalization_crawl_report")
+        # Persist so the report survives reruns (expander clicks, tab switches…).
+        st.session_state["crawl"] = {"pages": pages, "groups": groups,
+                                     "rep": rep, "plans": plans}
+
+    crawl = st.session_state.get("crawl")
+    if crawl is not None:
+        render_crawl_results(crawl)
 
 # ---- Tab 2: GSC ---------------------------------------------------------- #
 with tab_gsc:
@@ -1394,7 +1564,30 @@ with tab_gsc:
                                     f"pos **{float(row['position']):.1f}**")
                             render_link_checklist(str(row["page"]), role, actions, meta_md=meta)
 
-                df_download_buttons(report, "cannibalization_gsc_report")
+                counts = _sev_counts(report)
+                summary = [
+                    f"Cannibalized keywords: {len(report)}",
+                    f"Critical: {counts['Critical']}   High: {counts['High']}   "
+                    f"Medium: {counts['Medium']}   Low: {counts['Low']}",
+                    f"Impressions affected: {int(report['impressions'].sum()):,}",
+                    f"Clicks affected: {int(report['clicks'].sum()):,}",
+                ]
+                sections = [
+                    {
+                        "heading": f"[{r['severity']}] {r['keyword']} — {r['competing_urls']} URLs · "
+                                   f"{r['impressions']:,} impr · pos {r['avg_position']}",
+                        "severity": r["severity"],
+                        "urls": list(r["urls"]),
+                        "recommendation": "",
+                        "diagnosis": plans[r["keyword"]][1].get("diagnosis", []),
+                        "checklist": plans[r["keyword"]][1].get("checklist", {}),
+                    }
+                    for _, r in report.iterrows()
+                ]
+                df_download_buttons(report, "cannibalization_gsc_report",
+                                    pdf_sections=sections,
+                                    pdf_title="Keyword Cannibalization — Search Console Report",
+                                    pdf_summary=summary)
 
  
 

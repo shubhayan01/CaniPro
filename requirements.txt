@@ -5,3 +5,4 @@ pandas>=2.0
 groq>=0.11
 google-api-python-client>=2.100
 google-auth>=2.30
+fpdf2>=2.7
